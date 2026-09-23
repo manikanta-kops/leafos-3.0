@@ -14,7 +14,7 @@ LeafOS is a persistent system that coordinates conversations and AI work. Interf
 
 Initially, one backend runs on one trusted host, with storage and execution on that host. The owner connects through Leaf UI from multiple devices over Tailscale. The architecture must admit multiple people later, without pretending that the first version already provides separate-user security or host isolation.
 
-LeafOS 2.0 runs on the Mac Studio. During development, keep its laptop daemon stopped. Any future operational work must first follow current deployment and connection documentation and announce the connection or change. Writing this plan requires no connection, service start, deployment, or migration of 2.0.
+Development of this version does not require operating or migrating an existing installation. Deployment-specific connection details and operational instructions belong in private documentation.
 
 ### Initial scope
 

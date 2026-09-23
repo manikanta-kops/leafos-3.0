@@ -1,0 +1,167 @@
+import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
+import { cpSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { test } from 'node:test'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { runInNewContext } from 'node:vm'
+import { build } from 'esbuild'
+
+const coreRoot = fileURLToPath(new URL('../../', import.meta.url))
+const npmCli = process.env.npm_execpath
+const compiler = path.join(coreRoot, 'node_modules/typescript/bin/tsc')
+const guard = fileURLToPath(new URL('./import-guard.mjs', import.meta.url))
+
+function run(command, args, cwd, timeout = 60_000) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd, timeout, stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, NODE_PATH: '', NODE_OPTIONS: '' },
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk })
+    child.stderr.setEncoding('utf8').on('data', (chunk) => { stderr += chunk })
+    child.on('error', reject)
+    child.on('close', (code, signal) => {
+      if (code !== 0) reject(new Error(`${command} ${args.join(' ')} failed (${code ?? signal})\n${stdout}\n${stderr}`))
+      else resolve(stdout)
+    })
+  })
+}
+
+function filesUnder(directory) {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const filename = path.join(directory, entry.name)
+    assert.equal(entry.isSymbolicLink(), false, `Unexpected linked package file: ${filename}`)
+    return entry.isDirectory() ? filesUnder(filename) : [filename]
+  })
+}
+
+test('Core works as a packed package outside repository resolution', { timeout: 180_000 }, async (t) => {
+  assert.ok(npmCli, 'Run this check through npm run test:package')
+  const temporary = mkdtempSync(path.join(tmpdir(), 'leafos-package-'))
+  t.after(() => rmSync(temporary, { recursive: true, force: true }))
+  assert.ok(!temporary.startsWith(coreRoot), 'Consumer must be outside the repository')
+  const consumer = path.join(temporary, 'consumer')
+  mkdirSync(consumer)
+  const npm = (args, cwd) => run(process.execPath, [npmCli, ...args, '--cache', path.join(temporary, 'npm-cache')], cwd)
+
+  // Exercise the real prepack lifecycle, then install only the produced tarball.
+  await npm(['pack', '--pack-destination', temporary], coreRoot)
+  const tarballs = readdirSync(temporary).filter((name) => name.endsWith('.tgz'))
+  assert.equal(tarballs.length, 1)
+  const tarball = path.join(temporary, tarballs[0])
+  writeFileSync(path.join(consumer, 'package.json'), JSON.stringify({
+    name: 'leafos-isolated-consumer', version: '0.0.0', private: true, type: 'module',
+    dependencies: { '@leafos/core': pathToFileURL(tarball).href },
+  }, null, 2))
+  await npm(['install', '--offline', '--ignore-scripts', '--no-audit', '--no-fund'], consumer)
+  const installedRoot = path.join(consumer, 'node_modules/@leafos/core')
+  const installed = JSON.parse(readFileSync(path.join(installedRoot, 'package.json'), 'utf8'))
+  const installedFiles = filesUnder(installedRoot)
+
+  await t.test('all exports have shipped JavaScript and declarations; private files stay private', async () => {
+    assert.equal(lstatSync(installedRoot).isSymbolicLink(), false)
+    assert.deepEqual(Object.keys(installed.exports).sort(), ['./adapter', './client', './protocol'])
+    for (const entry of Object.values(installed.exports)) {
+      assert.ok(entry.types.endsWith('.d.ts'))
+      assert.ok(entry.import.endsWith('.js'))
+      for (const target of [entry.types, entry.import, entry.default]) {
+        assert.ok(statSync(path.join(installedRoot, target)).isFile())
+      }
+    }
+    for (const filename of installedFiles) {
+      assert.match(path.relative(installedRoot, filename).split(path.sep).join('/'), /^(dist\/|README\.md$|package\.json$)/)
+    }
+    await run(process.execPath, ['--input-type=module', '-e', `
+      import assert from 'node:assert/strict';
+      for (const specifier of ['@leafos/core', '@leafos/core/dist/protocol/index.js']) {
+        await assert.rejects(import(specifier), { code: 'ERR_PACKAGE_PATH_NOT_EXPORTED' });
+      }
+    `], consumer)
+  })
+
+  for (const subpath of Object.keys(installed.exports)) {
+    const specifier = `@leafos/core${subpath.slice(1)}`
+    await t.test(`${specifier} imports without starting resources and exits naturally`, async () => {
+      const output = await run(process.execPath, ['--import', guard, '--input-type=module', '-e', `
+        await import(${JSON.stringify(specifier)});
+        console.log('import completed');
+      `], consumer, 10_000)
+      assert.equal(output.trim(), 'import completed')
+    })
+  }
+
+  await t.test('import guard detects attempted startup, including unreferenced resources', async () => {
+    for (const effect of [
+      'import("node:net").then(net => net.createServer().listen(0).unref())',
+      'import("node:child_process").then(cp => cp.spawn(process.execPath, ["-e", ""]))',
+      'setInterval(() => {}, 1000).unref()',
+    ]) {
+      await assert.rejects(run(process.execPath, ['--import', guard, '--input-type=module', '-e', `await ${effect}`], consumer, 10_000), /Import attempted/)
+    }
+  })
+
+  cpSync(fileURLToPath(new URL('./fixtures/', import.meta.url)), path.join(consumer, 'src'), { recursive: true })
+  const compilerOptions = {
+    target: 'ES2023', strict: true, exactOptionalPropertyTypes: true,
+    types: [], skipLibCheck: false, verbatimModuleSyntax: true,
+  }
+  writeFileSync(path.join(consumer, 'tsconfig.node.json'), JSON.stringify({
+    compilerOptions: { ...compilerOptions, module: 'NodeNext', moduleResolution: 'NodeNext', lib: ['ES2023'], rootDir: 'src', outDir: 'dist', noEmitOnError: true },
+    include: ['src/**/*.ts'],
+  }))
+  writeFileSync(path.join(consumer, 'tsconfig.browser.json'), JSON.stringify({
+    compilerOptions: { ...compilerOptions, module: 'ESNext', moduleResolution: 'Bundler', lib: ['ES2023', 'DOM'], noEmit: true },
+    include: ['src/browser.ts'],
+  }))
+
+  await t.test('emitted types resolve under NodeNext and browser resolution without ambient Node types', async () => {
+    await run(process.execPath, [compiler, '-p', 'tsconfig.node.json'], consumer)
+    await run(process.execPath, [compiler, '-p', 'tsconfig.browser.json'], consumer)
+  })
+
+  await t.test('adapter fixture uses the injected host and no runtime singleton', async () => {
+    await run(process.execPath, ['--import', guard, '--input-type=module', '-e', `
+      import assert from 'node:assert/strict';
+      import { createFixtureAdapter } from './dist/adapter.js';
+      const first = [];
+      const second = [];
+      const a = await createFixtureAdapter({ record: value => first.push(value) });
+      const b = await createFixtureAdapter({ record: value => second.push(value) });
+      assert.equal(a.id, 'packaging-fixture');
+      assert.deepEqual(first, []);
+      a.record();
+      assert.deepEqual(first, ['fixture used the supplied host']);
+      assert.deepEqual(second, []);
+      b.record();
+      assert.deepEqual(second, ['fixture used the supplied host']);
+    `], consumer, 10_000)
+  })
+
+  await t.test('protocol/client browser bundle has no backend imports and runs without Node globals', async () => {
+    const bundle = await build({
+      absWorkingDir: consumer, entryPoints: ['src/browser.ts'], bundle: true,
+      platform: 'browser', format: 'iife', globalName: 'LeafosFixture',
+      target: 'es2023', treeShaking: false, metafile: true, write: false,
+    })
+    for (const input of Object.keys(bundle.metafile.inputs)) {
+      assert.ok(input === 'src/browser.ts' || input.startsWith('node_modules/@leafos/core/dist/protocol/'), `Unexpected browser input: ${input}`)
+    }
+    for (const output of Object.values(bundle.metafile.outputs)) assert.deepEqual(output.imports, [])
+    const browser = { URL }
+    runInNewContext(bundle.outputFiles[0].text, browser)
+    assert.equal(browser.LeafosFixture.options.baseUrl, 'https://leaf.example/')
+    t.diagnostic(`Unminified consumer browser bundle: ${bundle.outputFiles[0].contents.byteLength} bytes; no backend or external imports.`)
+  })
+
+  await t.test('installation footprint is reported independently of browser bundling', async () => {
+    const tree = JSON.parse(await npm(['ls', '--all', '--json'], consumer))
+    assert.deepEqual(Object.keys(tree.dependencies), ['@leafos/core'])
+    assert.deepEqual(Object.keys(tree.dependencies['@leafos/core'].dependencies ?? {}), [])
+    const bytes = installedFiles.reduce((total, filename) => total + statSync(filename).size, 0)
+    t.diagnostic(`Packed Core: ${statSync(tarball).size} bytes; installed Core: ${installedFiles.length} files, ${bytes} bytes; runtime dependencies: 0. Compiler, bundler and Node types are development-only dependencies.`)
+  })
+})

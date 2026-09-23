@@ -6,7 +6,7 @@ This block complements blocks 1–5. It describes distribution, setup, and the o
 
 ## 1. Backend host and desktop client
 
-LeafOS runs on the computer on which its owner installs it. It is not intrinsically tied to the developer's Mac Studio or laptop. That host runs Core, its execution integrations, and the managed storage/dependencies established in earlier blocks.
+LeafOS runs on the computer on which its owner installs it. That host runs Core, its execution integrations, and the managed storage/dependencies established in earlier blocks.
 
 The first interface is a separately installed desktop application. It can run on the backend host or on another computer. It connects to the configured backend URL through Tailscale; a client-only computer does not need its own LeafOS database or execution harness.
 
